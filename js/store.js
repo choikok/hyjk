@@ -7,10 +7,14 @@ const KEYS = {
   sessions: 'hyjk.sessions.v1',
 };
 
+const SETTINGS_VERSION = 2;
+
 export const DEFAULT_SETTINGS = {
+  version: SETTINGS_VERSION,
   apiKey: '',
-  engine: 'precise',            // 'precise' (인식+GPT 번역, 용어사전) | 'fast' (gpt-realtime-translate)
-  direction: 'auto',            // 'auto' | 'en2ko' | 'ko2en'
+  engine: 'free',               // 'free' (내장 음성인식+무료 번역) | 'precise' (OpenAI 인식+GPT, 유료) | 'fast' (gpt-realtime-translate, 유료)
+  freeTranslator: 'google',     // 무료 모드의 번역기: 'google' (키 불필요) | 'gpt' (API 키 필요)
+  direction: 'en2ko',           // 'auto' (유료 모드만) | 'en2ko' | 'ko2en'
   topic: '',                    // 강연 주제/배경 (정밀 모드 번역에 사용)
   micId: '',
   noise: 'far_field',           // 'far_field' (강연장) | 'near_field' (핀마이크)
@@ -43,7 +47,16 @@ function write(key, value) {
 }
 
 export function loadSettings() {
-  return { ...DEFAULT_SETTINGS, ...read(KEYS.settings, {}) };
+  const saved = read(KEYS.settings, {});
+  const settings = { ...DEFAULT_SETTINGS, ...saved };
+  if ((saved.version || 1) < 2) {
+    // v2: 무료 모드가 기본이 됐다
+    settings.engine = 'free';
+    if (settings.direction === 'auto') settings.direction = 'en2ko';
+    settings.version = SETTINGS_VERSION;
+    write(KEYS.settings, settings);
+  }
+  return settings;
 }
 
 export function saveSettings(settings) {

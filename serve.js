@@ -18,6 +18,17 @@ const TYPES = {
 };
 
 http.createServer((req, res) => {
+  if (req.method === 'OPTIONS') {
+    // 배포된(https) 사이트에서 이 로컬 서버의 테스트 파일을 불러올 수 있게 허용
+    res.writeHead(204, {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET',
+      'Access-Control-Allow-Headers': '*',
+      'Access-Control-Allow-Private-Network': 'true',
+    });
+    res.end();
+    return;
+  }
   const urlPath = decodeURIComponent(new URL(req.url, 'http://x').pathname);
   let file = path.normalize(path.join(ROOT, urlPath));
   if (!file.startsWith(ROOT)) { res.writeHead(403); res.end(); return; }
@@ -28,6 +39,7 @@ http.createServer((req, res) => {
       'Content-Type': TYPES[path.extname(file)] || 'application/octet-stream',
       'Cache-Control': 'no-cache',
       'Access-Control-Allow-Origin': '*', // 배포된 사이트에서 로컬 수정본을 불러와 시험할 수 있게
+      'Access-Control-Allow-Private-Network': 'true',
     });
     res.end(data);
   });

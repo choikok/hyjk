@@ -1,8 +1,9 @@
 // 정밀 모드: OpenAI 실시간 음성인식(원문 스트리밍) → 문장이 끝나면 GPT가 용어 사전을 반영해 번역(스트리밍)
 
-import { createClientSecret, connectRealtime, streamText, checkCredits, isQuotaError, QUOTA_MESSAGE } from '../openai.js';
+import { createClientSecret, connectRealtime, checkCredits, isQuotaError, QUOTA_MESSAGE } from '../openai.js';
+import { gptTranslate } from '../translate.js';
 import { VoiceActivity } from '../vad.js';
-import { detectLang, directionFor, targetOf, LANG_NAMES } from '../lang.js';
+import { detectLang, directionFor, targetOf } from '../lang.js';
 
 const CLIENT_VAD_MODELS = new Set(['gpt-live-transcribe']); // 서버 VAD를 지원하지 않아 직접 끊어줘야 하는 모델
 const FALLBACK_STT_MODEL = 'gpt-4o-transcribe';           // 브라우저(WebRTC) 연결이 확인된 안정형 모델
@@ -148,7 +149,7 @@ export class PreciseEngine {
   // 실시간 연결이 500으로 실패하면: 잔액 부족인지 먼저 확인하고, 아니면 안정형 인식 모델로 바꿔 다시 연결한다
   async recoverFromServerError(err) {
     try {
-      await checkCredits(this.settings.apiKey, this.settings.mtModel);
+      await checkCredits(this.settings.apiKey);
     } catch (creditErr) {
       if (creditErr.fatal) return this.fail(creditErr);
     }
@@ -274,20 +275,19 @@ export class PreciseEngine {
     seg.translating = true;
     if (!seg.dir) seg.dir = this.settings.direction === 'auto' ? 'en2ko' : this.settings.direction;
 
-    const context = this.history.slice(-4).join('\n');
+    const context = this.history.slice(-4);
     this.history.push(seg.src);
     if (this.history.length > 20) this.history.shift();
 
-    const input = context
-      ? `<context>\n${context}\n</context>\n<translate>\n${seg.src}\n</translate>`
-      : `<translate>\n${seg.src}\n</translate>`;
-
     try {
-      seg.tr = await streamText({
+      seg.tr = await gptTranslate({
         apiKey: this.settings.apiKey,
         model: this.settings.mtModel,
-        instructions: this.instructions(targetOf(seg.dir)),
-        input,
+        text: seg.src,
+        target: targetOf(seg.dir),
+        glossary: this.glossary,
+        topic: this.settings.topic,
+        context,
         onDelta: (text) => {
           seg.tr = text;
           this.cb.onSegment(seg);
@@ -301,33 +301,5 @@ export class PreciseEngine {
     seg.final = true;
     this.segs.delete(seg.itemId);
     this.cb.onSegment(seg);
-  }
-
-  instructions(target) {
-    const lang = LANG_NAMES[target];
-    const lines = [
-      'You are an expert simultaneous interpreter at a live corporate event: lectures by a speaker from the foreign headquarters and role-play sessions among Korean participants.',
-      `Translate the text inside <translate> into ${lang}. Output ONLY the translation, with no quotes, labels, notes or explanations.`,
-      '',
-      'Rules:',
-      '- Convey the meaning faithfully and naturally, the way a skilled interpreter would say it out loud. Prefer short, clear sentences.',
-      '- The text comes from live speech recognition and may contain recognition errors, fillers or cut-off fragments. Infer the intended meaning from the context. Drop fillers (um, uh, you know, 어, 음, 그).',
-      '- If the text is a fragment, translate it as a fragment. Never add content that was not said.',
-      '- <context> holds the previous lines for reference only. Never translate or repeat it.',
-      `- If the text is already in ${lang}, output it unchanged (fix obvious recognition errors only).`,
-      '- Keep names, numbers, dates, units and brand names accurate.',
-      target === 'ko'
-        ? '- Korean output: natural spoken Korean suitable for a lecture, polite style (합니다/해요체). Avoid translationese.'
-        : '- English output: natural, professional spoken English that a native speaker would use.',
-    ];
-
-    if (this.glossary.length) {
-      lines.push('', 'Glossary (always use these translations; a term mapped to itself must be kept as-is):');
-      for (const { en, ko } of this.glossary) lines.push(`- ${en} ⇄ ${ko}`);
-    }
-    if (this.settings.topic) {
-      lines.push('', `Event context: ${this.settings.topic.trim()}`);
-    }
-    return lines.join('\n');
   }
 }

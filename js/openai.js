@@ -37,14 +37,26 @@ async function apiError(res) {
   return new ApiError(message, res.status, body);
 }
 
-// 잔액이 있는지 아주 작은 요청으로 확인한다 (실시간 연결은 잔액이 없을 때 원인 없이 500만 돌려주는 경우가 있다)
-export async function checkCredits(apiKey, model = 'gpt-6-luna') {
+// 번역 모델이 실제로 응답하는지 아주 작은 요청으로 확인한다
+export async function checkTextModel(apiKey, model) {
   const res = await safeFetch(`${API}/responses`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model, input: 'ok', max_output_tokens: 16, store: false }),
+    body: JSON.stringify({ model, input: 'ok', max_output_tokens: 16, store: false, reasoning: { effort: 'none' } }),
   });
   if (!res.ok) throw await apiError(res);
+}
+
+// 잔액이 있는지 아주 작은 음성 요청으로 확인한다 (실시간 연결은 잔액이 없을 때 원인 없이 500만 돌려주는 경우가 있다).
+// 텍스트 모델은 잔액이 없어도 무료 사용량으로 통과하는 경우가 있어서, 실시간 통역과 같은 음성 계열 API로 확인한다.
+export async function checkCredits(apiKey) {
+  const res = await safeFetch(`${API}/audio/speech`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: 'gpt-4o-mini-tts', voice: 'alloy', input: 'ok', response_format: 'pcm' }),
+  });
+  if (!res.ok) throw await apiError(res);
+  await res.arrayBuffer();
 }
 
 // 네트워크 오류(인터넷 끊김, 또는 오류 응답에 CORS 헤더가 없는 경우)를 알아보기 쉬운 메시지로 바꾼다

@@ -1,9 +1,10 @@
 import {
   loadSettings, saveSettings, loadGlossaryText, saveGlossaryText, parseGlossary, loadSessions, saveSessions,
 } from './store.js';
-import { testApiKey, checkCredits } from './openai.js';
+import { testApiKey, checkCredits, checkTextModel } from './openai.js';
 import { PreciseEngine } from './engines/precise.js';
 import { FastEngine } from './engines/fast.js';
+import { FreeEngine, speechRecognitionSupported } from './engines/free.js';
 import { DIRECTION_LABELS, targetOf } from './lang.js';
 import { exportTxt, exportCsv, deliverFile } from './export.js';
 
@@ -52,21 +53,50 @@ const segNodes = new Map(); // seg.id -> DOM
 // 시작 / 정지
 // ======================================================================
 
+const ENGINES = { free: FreeEngine, precise: PreciseEngine, fast: FastEngine };
+
+function engineClass() {
+  return ENGINES[settings.engine] || FreeEngine;
+}
+
+// API 키가 필요한 설정인지 (무료 모드 + Google 번역이면 필요 없음)
+function needsApiKey() {
+  return settings.engine !== 'free' || settings.freeTranslator === 'gpt';
+}
+
 async function start() {
   if (running) return;
-  if (!settings.apiKey) {
+  if (needsApiKey() && !settings.apiKey) {
     openPanel('settings');
-    showToast('먼저 OpenAI API 키를 입력해주세요.', 'info');
-    $('#apiKey').focus();
+    showToast(settings.engine === 'free'
+      ? 'GPT 번역을 쓰려면 API 키가 필요합니다. 키가 없으면 번역기를 "Google 번역"으로 바꿔주세요.'
+      : '유료 모드는 OpenAI API 키가 필요합니다. 키 없이 쓰려면 번역 엔진을 "무료"로 바꿔주세요.', 'info');
+    return;
+  }
+  if (settings.engine === 'free' && !speechRecognitionSupported()) {
+    showToast('이 브라우저는 무료 음성인식을 지원하지 않습니다. 아이폰은 Safari, PC는 Chrome 또는 Edge를 사용해주세요.');
     return;
   }
 
   els.startBtn.disabled = true;
+  // 아이폰은 소리를 낸 직후 음성인식을 켜면 멈추는 버그가 있어서, 읽어주기를 켰을 때만 준비한다
+  if (settings.tts) unlockSpeech();
+
+  // 무료 모드는 음성인식이 마이크를 직접 열므로 여기서 마이크를 열지 않는다
+  if (engineClass().needsMicStream === false) {
+    if (!record) newRecord();
+    running = true;
+    updateRunningUi();
+    requestWakeLock();
+    await startEngine();
+    els.startBtn.disabled = false;
+    return;
+  }
+
   // iOS는 사용자 탭 안에서 오디오를 열어야 하므로 await 전에 만든다
   const Ctx = window.AudioContext || window.webkitAudioContext;
   audioCtx = new Ctx();
   audioCtx.resume();
-  unlockSpeech();
 
   try {
     stream = await navigator.mediaDevices.getUserMedia({
@@ -102,7 +132,7 @@ async function start() {
 }
 
 async function startEngine() {
-  const Engine = settings.engine === 'fast' ? FastEngine : PreciseEngine;
+  const Engine = engineClass();
   engine = new Engine({
     settings,
     glossary,
@@ -152,9 +182,16 @@ function stop() {
 
 async function restartEngine() {
   if (!running) return;
-  engine?.stop();
+  const old = engine;
   engine = null;
-  await startEngine();
+  if (old?.kind === 'free') {
+    // 내장 음성인식은 한 번에 하나만 켤 수 있어서, 이전 것을 바로 끄고 잠깐 기다린다
+    old.stop({ immediate: true });
+    await new Promise((r) => setTimeout(r, 300));
+  } else {
+    old?.stop();
+  }
+  if (running) await startEngine();
 }
 
 function updateRunningUi() {
@@ -311,9 +348,21 @@ function applyDirection() {
 }
 
 els.dirChip.addEventListener('click', () => {
-  const order = ['auto', 'en2ko', 'ko2en'];
+  // 무료 모드는 자동 감지가 없어서 영→한 / 한→영만 오간다
+  const order = settings.engine === 'free' ? ['en2ko', 'ko2en'] : ['auto', 'en2ko', 'ko2en'];
   setDirection(order[(order.indexOf(settings.direction) + 1) % order.length]);
 });
+
+// 엔진에 맞게 화면을 바꾼다 (무료 모드에서 안 쓰는 설정 숨김, 자동 감지 해제)
+function applyEngine() {
+  if (settings.engine === 'free' && settings.direction === 'auto') {
+    settings.direction = 'en2ko';
+    saveSettings(settings);
+  }
+  $$('[data-show]').forEach((el) => { el.hidden = !el.dataset.show.split(' ').includes(settings.engine); });
+  applyDirection();
+  updateKeyHint();
+}
 
 function setDirection(dir) {
   if (settings.direction === dir) return;
@@ -363,8 +412,8 @@ function pickVoice(lang) {
 }
 
 function speak(seg) {
-  // 초고속 모드는 AI 통역 음성을 직접 재생하므로 여기서는 정밀 모드만 처리
-  if (!settings.tts || settings.engine !== 'precise' || !running || !seg.tr || seg.error) return;
+  // 초고속 모드는 AI 통역 음성을 직접 재생하므로 여기서는 무료·정밀 모드만 처리
+  if (!settings.tts || settings.engine === 'fast' || !running || !seg.tr || seg.error) return;
   if (!('speechSynthesis' in window)) return;
   const lang = targetOf(seg.dir) === 'ko' ? 'ko-KR' : 'en-US';
   const u = new SpeechSynthesisUtterance(seg.tr);
@@ -558,9 +607,10 @@ function fillSettingsForm() {
   $('#mtModel').value = settings.mtModel;
   $('#silenceMs').value = settings.silenceMs;
   $('#silenceOut').textContent = `${(settings.silenceMs / 1000).toFixed(1)}초`;
-  for (const name of ['engine', 'direction', 'noise', 'theme']) {
+  for (const name of ['engine', 'direction', 'freeTranslator', 'noise', 'theme']) {
     $$(`input[name="${name}"]`).forEach((r) => { r.checked = r.value === settings[name]; });
   }
+  applyEngine();
   const glossaryText = loadGlossaryText();
   $('#glossary').value = glossaryText;
   updateGlossaryCount(glossaryText);
@@ -582,13 +632,26 @@ $('#showSource').addEventListener('change', (e) => { update('showSource', e.targ
 $('#silenceMs').addEventListener('input', (e) => { $('#silenceOut').textContent = `${(e.target.value / 1000).toFixed(1)}초`; });
 $('#silenceMs').addEventListener('change', (e) => update('silenceMs', Number(e.target.value), { restart: settings.engine === 'precise' }));
 
-for (const name of ['engine', 'direction', 'noise', 'theme']) {
+for (const name of ['engine', 'direction', 'freeTranslator', 'noise', 'theme']) {
   $$(`input[name="${name}"]`).forEach((r) => r.addEventListener('change', () => {
     if (!r.checked) return;
     if (name === 'direction') return setDirection(r.value);
+    if (name === 'engine') return setEngine(r.value);
     update(name, r.value, { restart: name !== 'theme' });
     if (name === 'theme') applyTheme();
   }));
+}
+
+function setEngine(value) {
+  if (settings.engine === value) return;
+  settings.engine = value;
+  saveSettings(settings);
+  applyEngine();
+  // 엔진마다 마이크를 여는 방식이 달라서 실행 중이면 멈추고 다시 시작하게 한다
+  if (running) {
+    stop();
+    showToast('번역 엔진을 바꿨습니다. 시작 버튼을 다시 눌러주세요.', 'info', 3000);
+  }
 }
 
 $('#micSelect').addEventListener('change', async (e) => {
@@ -630,7 +693,15 @@ $('#testKeyBtn').addEventListener('click', async () => {
   out.textContent = '확인 중...';
   try {
     const models = await testApiKey(key);
-    await checkCredits(key, settings.mtModel); // 키가 맞아도 잔액이 없으면 통역이 안 되므로 함께 확인
+    if (settings.engine === 'free') {
+      // 무료 모드에서는 GPT 번역만 쓰므로 번역 모델이 실제로 응답하는지만 확인한다
+      await checkTextModel(key, settings.mtModel);
+      out.textContent = '✓ GPT 번역을 사용할 수 있습니다.';
+      out.classList.add('ok');
+      updateKeyHint();
+      return;
+    }
+    await checkCredits(key); // 키가 맞아도 잔액이 없으면 통역이 안 되므로 함께 확인
     const need = ['gpt-4o-transcribe', 'gpt-realtime-translate', settings.mtModel];
     const missing = need.filter((m) => !models.includes(m));
     if (missing.length) {
@@ -656,12 +727,12 @@ $('#saveGlossary').addEventListener('click', () => {
   const text = $('#glossary').value;
   saveGlossaryText(text);
   glossary = parseGlossary(text);
-  if (engine?.kind === 'precise') engine.glossary = glossary; // 번역에는 바로 반영
+  if (engine && engine.kind !== 'fast') engine.glossary = glossary; // 번역에는 바로 반영
   showToast(`용어 ${glossary.length}개를 저장했습니다.`, 'info', 1800);
 });
 
 function updateKeyHint() {
-  els.emptyKeyHint.hidden = !!settings.apiKey;
+  els.emptyKeyHint.hidden = !needsApiKey() || !!settings.apiKey;
 }
 
 // ======================================================================
@@ -702,9 +773,8 @@ window.addEventListener('pagehide', () => persistRecord());
 applyTheme();
 applyFontSize();
 applyShowSource();
-applyDirection();
+applyEngine();
 applyTts();
-updateKeyHint();
 setStatus('idle');
 
 // 주소 끝에 ?demo 를 붙이면 예시 자막을 보여준다 (프로젝터에서 글자 크기 맞춰볼 때)

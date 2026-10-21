@@ -349,8 +349,7 @@ input[type="range"] { width: 100%; accent-color: var(--accent); }
 .btn.danger { color: var(--danger); }
 .btn.small { padding: 6px 10px; font-size: 13px; }
 
-.seg-control { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-.seg-control.three { grid-template-columns: repeat(3, 1fr); }
+.seg-control { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); gap: 8px; }
 .seg-control.compact { margin-top: 10px; }
 .seg-control label { position: relative; }
 .seg-control input { position: absolute; opacity: 0; pointer-events: none; }

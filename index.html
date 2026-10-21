@@ -34,9 +34,9 @@
         <h1>HYJK 동시통역</h1>
         <p>아래 <b>시작</b> 버튼을 누르면 마이크로 들리는 말을 실시간으로 번역합니다.</p>
         <ul>
-          <li><b>강연</b> — 영어 강연이 한국어 자막으로 나옵니다.</li>
-          <li><b>롤플레잉</b> — 한국어 대화가 영어 자막으로 나옵니다.</li>
-          <li>자동 모드에서는 한국어·영어를 알아서 구분합니다.</li>
+          <li><b>강연</b> — 위쪽 버튼을 <b>영어 → 한국어</b>로 두면 영어 강연이 한국어 자막으로 나옵니다.</li>
+          <li><b>롤플레잉</b> — <b>한국어 → 영어</b>로 바꾸면 한국어 대화가 영어 자막으로 나옵니다.</li>
+          <li>기본은 <b>무료 모드</b>입니다. 별도 결제 없이 쓸 수 있습니다.</li>
         </ul>
         <p id="emptyKeyHint" class="hint" hidden>먼저 <button type="button" class="link" data-open="settings">설정</button>에서 OpenAI API 키를 입력해주세요.</p>
       </div>
@@ -80,7 +80,35 @@
       <!-- 설정 -->
       <section data-pane="settings">
         <div class="field">
-          <label for="apiKey">OpenAI API 키</label>
+          <span class="label">번역 엔진</span>
+          <div class="seg-control three" data-setting="engine">
+            <label><input type="radio" name="engine" value="free"><span><b>무료</b><small>기기 내장 음성인식</small></span></label>
+            <label><input type="radio" name="engine" value="precise"><span><b>정밀</b><small>유료 · 자동 감지</small></span></label>
+            <label><input type="radio" name="engine" value="fast"><span><b>초고속</b><small>유료 · 동시통역</small></span></label>
+          </div>
+          <p class="help" data-show="free">API 키 없이 무료로 씁니다. 말이 끝나면 문장 단위로 번역되고, 언어 방향은 직접 골라야 합니다.</p>
+          <p class="help" data-show="precise fast">OpenAI 크레딧(유료)이 필요합니다. 한국어·영어를 자동으로 구분합니다.</p>
+        </div>
+
+        <div class="field">
+          <span class="label">언어 방향</span>
+          <div class="seg-control three" data-setting="direction">
+            <label><input type="radio" name="direction" value="en2ko"><span><b>영 → 한</b><small>강연</small></span></label>
+            <label><input type="radio" name="direction" value="ko2en"><span><b>한 → 영</b><small>롤플레잉</small></span></label>
+            <label data-show="precise fast"><input type="radio" name="direction" value="auto"><span><b>자동</b><small>한↔영</small></span></label>
+          </div>
+        </div>
+
+        <div class="field" data-show="free">
+          <span class="label">번역기</span>
+          <div class="seg-control" data-setting="freeTranslator">
+            <label><input type="radio" name="freeTranslator" value="google"><span><b>Google 번역</b><small>무료 · 키 불필요</small></span></label>
+            <label><input type="radio" name="freeTranslator" value="gpt"><span><b>GPT</b><small>API 키 필요 · 문맥 반영</small></span></label>
+          </div>
+        </div>
+
+        <div class="field" id="apiKeyField">
+          <label for="apiKey">OpenAI API 키 <small data-show="free">(GPT 번역을 쓸 때만 필요)</small></label>
           <div class="row">
             <input id="apiKey" type="password" autocomplete="off" spellcheck="false" placeholder="sk-...">
             <button id="testKeyBtn" type="button" class="btn">확인</button>
@@ -90,33 +118,16 @@
         </div>
 
         <div class="field">
-          <span class="label">번역 엔진</span>
-          <div class="seg-control" data-setting="engine">
-            <label><input type="radio" name="engine" value="precise"><span><b>정밀</b><small>용어 사전 적용 · 문장 단위</small></span></label>
-            <label><input type="radio" name="engine" value="fast"><span><b>초고속</b><small>말하는 중에도 번역 · 사전 미적용</small></span></label>
-          </div>
-        </div>
-
-        <div class="field">
-          <span class="label">언어 방향</span>
-          <div class="seg-control three" data-setting="direction">
-            <label><input type="radio" name="direction" value="auto"><span><b>자동</b><small>한↔영</small></span></label>
-            <label><input type="radio" name="direction" value="en2ko"><span><b>영 → 한</b><small>강연</small></span></label>
-            <label><input type="radio" name="direction" value="ko2en"><span><b>한 → 영</b><small>롤플레잉</small></span></label>
-          </div>
-        </div>
-
-        <div class="field">
-          <label for="topic">강연 주제 · 배경 <small>(정밀 모드에서 번역 품질을 높여줍니다)</small></label>
+          <label for="topic">강연 주제 · 배경 <small>(GPT 번역 품질을 높여줍니다)</small></label>
           <textarea id="topic" rows="3" placeholder="예: 글로벌 본사 영업 리더십 교육. 강연자는 미국 본사 John Smith 부사장. 고객 상담 롤플레잉 포함."></textarea>
         </div>
 
-        <div class="field">
+        <div class="field" data-show="precise fast">
           <label for="micSelect">마이크</label>
           <select id="micSelect"><option value="">기본 마이크</option></select>
         </div>
 
-        <div class="field">
+        <div class="field" data-show="precise fast">
           <span class="label">마이크 환경</span>
           <div class="seg-control" data-setting="noise">
             <label><input type="radio" name="noise" value="far_field"><span><b>원거리</b><small>강연장 스피커 소리</small></span></label>

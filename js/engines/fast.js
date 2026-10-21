@@ -94,7 +94,7 @@ export class FastEngine {
       if (err.status >= 500) {
         // 실시간 연결은 잔액이 없을 때 원인 없이 500을 돌려주는 경우가 있어 잔액부터 확인한다
         try {
-          await checkCredits(this.settings.apiKey, this.settings.mtModel);
+          await checkCredits(this.settings.apiKey);
         } catch (creditErr) {
           if (creditErr.fatal) return this.fail(creditErr);
         }
