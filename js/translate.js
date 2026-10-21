@@ -43,15 +43,27 @@ export function applyGlossary(text, from, glossary) {
 
 // ---------- GPT 번역 ----------
 
-export function gptTranslate({ apiKey, model, text, target, glossary = [], topic = '', context = [], onDelta }) {
+// GPT가 "다른 언어라서 번역하지 않음"을 알릴 때 쓰는 표시
+export const SKIP = '<SKIP>';
+export const isSkip = (text) => text.trim().startsWith(SKIP);
+
+// filterSource: 'ko' | 'en' 이면 그 언어가 아닌 말(음성인식기가 억지로 받아 적은 다른 언어)은 SKIP을 돌려준다
+export async function gptTranslate({ apiKey, model, text, target, glossary = [], topic = '', context = [], filterSource = null, onDelta }) {
   const recent = context.slice(-4).join('\n');
   const input = recent
     ? `<context>\n${recent}\n</context>\n<translate>\n${text}\n</translate>`
     : `<translate>\n${text}\n</translate>`;
-  return streamText({ apiKey, model, instructions: gptInstructions(target, glossary, topic), input, onDelta });
+  return streamText({
+    apiKey,
+    model,
+    instructions: gptInstructions(target, glossary, topic, filterSource),
+    input,
+    // SKIP 표시가 만들어지는 도중("<SK")에는 화면에 내보내지 않는다
+    onDelta: onDelta && ((partial) => { if (!partial.trimStart().startsWith('<')) onDelta(partial); }),
+  });
 }
 
-function gptInstructions(target, glossary, topic) {
+function gptInstructions(target, glossary, topic, filterSource) {
   const lang = LANG_NAMES[target];
   const lines = [
     'You are an expert simultaneous interpreter at a live corporate event: lectures by a speaker from the foreign headquarters and role-play sessions among Korean participants.',
@@ -62,12 +74,27 @@ function gptInstructions(target, glossary, topic) {
     '- The text comes from live speech recognition and may contain recognition errors, fillers or cut-off fragments. Infer the intended meaning from the context. Drop fillers (um, uh, you know, 어, 음, 그).',
     '- If the text is a fragment, translate it as a fragment. Never add content that was not said.',
     '- <context> holds the previous lines for reference only. Never translate or repeat it.',
-    `- If the text is already in ${lang}, output it unchanged (fix obvious recognition errors only).`,
+    filterSource
+      ? `- If the text is in ${lang} already, output exactly ${SKIP}.`
+      : `- If the text is already in ${lang}, output it unchanged (fix obvious recognition errors only).`,
     '- Keep names, numbers, dates, units and brand names accurate.',
     target === 'ko'
       ? '- Korean output: natural spoken Korean suitable for a lecture, polite style (합니다/해요체). Avoid translationese.'
       : '- English output: natural, professional spoken English that a native speaker would use.',
   ];
+
+  if (filterSource) {
+    const src = LANG_NAMES[filterSource];
+    lines.push(
+      '',
+      'Language filter:',
+      `- The text comes from a speech recognizer listening ONLY for ${src}. When people speak another language, the recognizer still forces it into ${src}, producing text that is not genuine ${src} speech.`,
+      filterSource === 'ko'
+        ? '- Example: English speech written phonetically in Hangul, like "굿모닝 에브리원 투데이 아이 원트 투 토크" (good morning everyone today I want to talk). Korean loanwords used inside a normal Korean sentence (e.g. "미팅 일정을 체크해 주세요") ARE genuine Korean.'
+        : '- Example: Korean speech forced into English-sounding words, like "and young has say oh so come on yeah". Real English, even casual or fragmentary, IS genuine English.',
+      `- If the text is clearly NOT genuine ${src} speech, output exactly ${SKIP} and nothing else. If unsure, translate it.`,
+    );
+  }
 
   if (glossary.length) {
     lines.push('', 'Glossary (always use these translations; a term mapped to itself must be kept as-is):');

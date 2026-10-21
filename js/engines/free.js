@@ -2,8 +2,8 @@
 //          + Google 번역(무료). API 키가 있으면 GPT 번역을 고를 수도 있다.
 // 내장 음성인식은 한 번에 한 언어만 듣기 때문에 자동 감지는 없고, 방향(영→한 / 한→영)을 골라서 쓴다.
 
-import { googleTranslate, gptTranslate } from '../translate.js';
-import { targetOf } from '../lang.js';
+import { googleTranslate, gptTranslate, isSkip } from '../translate.js';
+import { targetOf, detectLang, looksLikeTransliteratedEnglish } from '../lang.js';
 
 const IS_IOS = /iPad|iPhone|iPod/.test(navigator.userAgent)
   || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
@@ -26,6 +26,8 @@ export class FreeEngine {
     this.glossary = glossary;
     this.cb = { onSegment, onRemove, onStatus, onError, onNotice };
     this.dir = settings.direction === 'ko2en' ? 'ko2en' : 'en2ko';
+    this.srcLang = this.dir === 'ko2en' ? 'ko' : 'en';   // 듣고 있는 언어
+    this.filter = settings.filterOther !== false;          // 다른 언어로 들린 말은 건너뛰기
     this.useGpt = settings.freeTranslator === 'gpt' && !!settings.apiKey;
     this.history = [];
     this.seq = 0;
@@ -202,6 +204,11 @@ export class FreeEngine {
     if (!text.trim()) return;
     if (!this.live) this.live = this.newSeg();
     this.live.src = text.trim();
+    // 다른 언어 글자로 적히는 중이면 화면에 띄우지 않는다 (말이 이어지며 언어가 바뀌면 다시 보인다)
+    if (this.filter && this.isOtherLanguage(this.live.src, false)) {
+      this.cb.onRemove(this.live.id);
+      return;
+    }
     this.cb.onSegment(this.live);
   }
 
@@ -214,9 +221,30 @@ export class FreeEngine {
       return;
     }
     seg.src = src;
+    if (this.filter && this.isOtherLanguage(src, true)) {
+      this.skip(seg);
+      return;
+    }
     seg.srcFinal = true;
     this.cb.onSegment(seg);
     this.translate(seg);
+  }
+
+  // 듣고 있는 언어가 아닌 말인지: ① 다른 언어 글자로 적혔거나 ② (한국어 모드) 영어를 소리대로 한글로 적은 경우.
+  // ②는 문장이 끝났을 때만 본다. GPT 번역을 쓰면 ②는 GPT가 더 정확하게 판단하므로 맡긴다.
+  isOtherLanguage(text, final) {
+    const lang = detectLang(text);
+    if (lang && lang !== this.srcLang) return true;
+    return final && !this.useGpt && this.srcLang === 'ko' && looksLikeTransliteratedEnglish(text);
+  }
+
+  skip(seg) {
+    this.cb.onRemove(seg.id);
+    if (!this.skipNoticeShown) {
+      this.skipNoticeShown = true;
+      const other = this.srcLang === 'ko' ? '영어' : '한국어';
+      this.cb.onNotice?.(`${other}로 들린 말은 번역하지 않고 건너뜁니다. (설정 → "다른 언어 걸러내기")`);
+    }
   }
 
   // 인식이 확정 없이 끝났으면 들은 데까지 확정한다
@@ -228,8 +256,6 @@ export class FreeEngine {
     const from = seg.dir === 'ko2en' ? 'ko' : 'en';
     const to = targetOf(seg.dir);
     const context = this.history.slice(-4);
-    this.history.push(seg.src);
-    if (this.history.length > 20) this.history.shift();
 
     try {
       if (this.useGpt) {
@@ -242,8 +268,13 @@ export class FreeEngine {
             glossary: this.glossary,
             topic: this.settings.topic,
             context,
+            filterSource: this.filter ? from : null,
             onDelta: (text) => { seg.tr = text; this.cb.onSegment(seg); },
           });
+          if (isSkip(seg.tr)) {
+            this.skip(seg);
+            return;
+          }
         } catch (err) {
           // GPT를 못 쓰면(잔액 없음 등) 무료 번역으로 바꿔서 계속한다
           this.useGpt = false;
@@ -257,6 +288,8 @@ export class FreeEngine {
       seg.error = true;
       this.cb.onError(err);
     }
+    this.history.push(seg.src);
+    if (this.history.length > 20) this.history.shift();
     seg.final = true;
     this.cb.onSegment(seg);
   }

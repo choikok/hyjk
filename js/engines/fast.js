@@ -193,8 +193,10 @@ export class FastEngine {
     if (srcLang) block.dir = directionFor(srcLang);
     else if (!block.dir) block.dir = lane.target === 'ko' ? 'en2ko' : 'ko2en';
 
-    // 자동 모드: 원문이 이미 이 세션의 출력 언어라면(=같은 말 반복) 숨긴다
-    const show = this.lanes.length === 1 || (srcLang !== null && srcLang !== lane.target);
+    // 원문이 이미 이 세션의 출력 언어라면(=같은 말 반복, 또는 걸러낼 다른 언어) 숨긴다.
+    // 방향을 고정하고 "다른 언어 걸러내기"를 끈 경우에만 모두 보여준다.
+    const showAll = this.lanes.length === 1 && this.settings.filterOther === false;
+    const show = showAll || (srcLang !== null && srcLang !== lane.target);
     if (show) {
       block.visible = true;
       this.cb.onSegment(block);

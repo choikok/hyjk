@@ -1,7 +1,7 @@
 // 정밀 모드: OpenAI 실시간 음성인식(원문 스트리밍) → 문장이 끝나면 GPT가 용어 사전을 반영해 번역(스트리밍)
 
 import { createClientSecret, connectRealtime, checkCredits, isQuotaError, QUOTA_MESSAGE } from '../openai.js';
-import { gptTranslate } from '../translate.js';
+import { gptTranslate, isSkip } from '../translate.js';
 import { VoiceActivity } from '../vad.js';
 import { detectLang, directionFor, targetOf } from '../lang.js';
 
@@ -211,6 +211,11 @@ export class PreciseEngine {
         const target = seg || this.segFor(ev.item_id);
         target.src = text;
         this.updateDirection(target);
+        // 방향을 고정했을 때 다른 언어로 들린 말은 건너뛴다
+        if (this.filterSource() && detectLang(text) && detectLang(text) !== this.filterSource()) {
+          this.removeSeg(target);
+          break;
+        }
         target.srcFinal = true;
         this.cb.onSegment(target);
         this.translate(target);
@@ -244,6 +249,13 @@ export class PreciseEngine {
       this.segs.set(itemId, seg);
     }
     return seg;
+  }
+
+  // 방향을 고정하고 "다른 언어 걸러내기"를 켰으면 듣는 언어('en' | 'ko'), 아니면 null
+  filterSource() {
+    const { direction, filterOther } = this.settings;
+    if (direction === 'auto' || filterOther === false) return null;
+    return direction === 'ko2en' ? 'ko' : 'en';
   }
 
   removeSeg(seg) {
@@ -288,11 +300,16 @@ export class PreciseEngine {
         glossary: this.glossary,
         topic: this.settings.topic,
         context,
+        filterSource: this.filterSource(),
         onDelta: (text) => {
           seg.tr = text;
           this.cb.onSegment(seg);
         },
       });
+      if (isSkip(seg.tr)) {
+        this.removeSeg(seg);
+        return;
+      }
     } catch (err) {
       seg.error = true;
       if (err.fatal && this.running) this.fail(err);

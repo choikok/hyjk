@@ -15,6 +15,7 @@ export const DEFAULT_SETTINGS = {
   engine: 'free',               // 'free' (내장 음성인식+무료 번역) | 'precise' (OpenAI 인식+GPT, 유료) | 'fast' (gpt-realtime-translate, 유료)
   freeTranslator: 'google',     // 무료 모드의 번역기: 'google' (키 불필요) | 'gpt' (API 키 필요)
   direction: 'en2ko',           // 'auto' (유료 모드만) | 'en2ko' | 'ko2en'
+  filterOther: true,            // 방향을 고정했을 때 다른 언어로 들린 말은 번역하지 않기
   topic: '',                    // 강연 주제/배경 (정밀 모드 번역에 사용)
   micId: '',
   noise: 'far_field',           // 'far_field' (강연장) | 'near_field' (핀마이크)

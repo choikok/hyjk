@@ -370,6 +370,7 @@ input[type="range"] { width: 100%; accent-color: var(--accent); }
 
 .switch { display: flex; align-items: center; gap: 10px; font-size: 15px; }
 .switch input { width: 20px; height: 20px; accent-color: var(--accent); }
+.filter-switch { margin-top: 12px; font-weight: 700; }
 
 .advanced { border-top: 1px solid var(--border); padding-top: 14px; }
 .advanced summary { cursor: pointer; font-weight: 700; color: var(--text-2); margin-bottom: 14px; }

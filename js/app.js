@@ -603,6 +603,7 @@ function fillSettingsForm() {
   $('#apiKey').value = settings.apiKey;
   $('#topic').value = settings.topic;
   $('#showSource').checked = settings.showSource;
+  $('#filterOther').checked = settings.filterOther;
   $('#sttModel').value = settings.sttModel;
   $('#mtModel').value = settings.mtModel;
   $('#silenceMs').value = settings.silenceMs;
@@ -629,6 +630,7 @@ $('#topic').addEventListener('change', (e) => update('topic', e.target.value));
 $('#mtModel').addEventListener('change', (e) => update('mtModel', e.target.value.trim() || 'gpt-6-luna'));
 $('#sttModel').addEventListener('change', (e) => update('sttModel', e.target.value, { restart: settings.engine === 'precise' }));
 $('#showSource').addEventListener('change', (e) => { update('showSource', e.target.checked); applyShowSource(); });
+$('#filterOther').addEventListener('change', (e) => update('filterOther', e.target.checked, { restart: true }));
 $('#silenceMs').addEventListener('input', (e) => { $('#silenceOut').textContent = `${(e.target.value / 1000).toFixed(1)}초`; });
 $('#silenceMs').addEventListener('change', (e) => update('silenceMs', Number(e.target.value), { restart: settings.engine === 'precise' }));
 
