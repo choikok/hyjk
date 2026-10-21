@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="112" fill="#0d1117"/>
+  <rect x="96" y="132" width="200" height="132" rx="36" fill="#4f9dff"/>
+  <path d="M140 264v52l52-52z" fill="#4f9dff"/>
+  <rect x="216" y="236" width="200" height="132" rx="36" fill="#ff5a5f"/>
+  <path d="M372 368v52l-52-52z" fill="#ff5a5f"/>
+  <text x="196" y="218" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="72" font-weight="800" fill="#ffffff">EN</text>
+  <text x="316" y="324" text-anchor="middle" font-family="'Apple SD Gothic Neo','Malgun Gothic',sans-serif" font-size="70" font-weight="800" fill="#ffffff">한</text>
+</svg>

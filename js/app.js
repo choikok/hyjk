@@ -1,0 +1,724 @@
+import {
+  loadSettings, saveSettings, loadGlossaryText, saveGlossaryText, parseGlossary, loadSessions, saveSessions,
+} from './store.js';
+import { testApiKey } from './openai.js';
+import { PreciseEngine } from './engines/precise.js';
+import { FastEngine } from './engines/fast.js';
+import { DIRECTION_LABELS, targetOf } from './lang.js';
+import { exportTxt, exportCsv, deliverFile } from './export.js';
+
+const $ = (sel) => document.querySelector(sel);
+const $$ = (sel) => [...document.querySelectorAll(sel)];
+
+const els = {
+  feed: $('#feed'),
+  empty: $('#empty'),
+  emptyKeyHint: $('#emptyKeyHint'),
+  status: $('#status'),
+  statusLabel: $('#status .label'),
+  dirChip: $('#dirChip'),
+  startBtn: $('#startBtn'),
+  startLabel: $('#startBtn .start-label'),
+  ttsBtn: $('#ttsBtn'),
+  fullBtn: $('#fullBtn'),
+  jumpBtn: $('#jumpBtn'),
+  toast: $('#toast'),
+  panel: $('#panel'),
+  viewer: $('#viewer'),
+};
+
+const STATUS_LABELS = {
+  idle: '대기',
+  connecting: '연결 중',
+  listening: '듣는 중',
+  reconnecting: '재연결 중',
+  error: '오류',
+};
+
+const settings = loadSettings();
+let glossary = parseGlossary(loadGlossaryText());
+let sessions = loadSessions();
+
+let running = false;
+let engine = null;
+let stream = null;
+let audioCtx = null;
+let wakeLock = null;
+let record = null;          // 현재 기록 중인 세션
+let stickToBottom = true;
+const segNodes = new Map(); // seg.id -> DOM
+
+// ======================================================================
+// 시작 / 정지
+// ======================================================================
+
+async function start() {
+  if (running) return;
+  if (!settings.apiKey) {
+    openPanel('settings');
+    showToast('먼저 OpenAI API 키를 입력해주세요.', 'info');
+    $('#apiKey').focus();
+    return;
+  }
+
+  els.startBtn.disabled = true;
+  // iOS는 사용자 탭 안에서 오디오를 열어야 하므로 await 전에 만든다
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  audioCtx = new Ctx();
+  audioCtx.resume();
+  unlockSpeech();
+
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        deviceId: settings.micId ? { exact: settings.micId } : undefined,
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
+    });
+  } catch (err) {
+    els.startBtn.disabled = false;
+    audioCtx.close();
+    audioCtx = null;
+    if (err.name === 'OverconstrainedError' && settings.micId) {
+      settings.micId = '';
+      saveSettings(settings);
+      showToast('선택한 마이크를 찾을 수 없어 기본 마이크로 바꿨습니다. 다시 시작해주세요.');
+    } else {
+      showToast('마이크를 사용할 수 없습니다. 브라우저의 마이크 권한을 허용해주세요. (' + (err.message || err.name) + ')');
+    }
+    return;
+  }
+
+  refreshMicList();
+  if (!record) newRecord();
+  running = true;
+  updateRunningUi();
+  requestWakeLock();
+  await startEngine();
+  els.startBtn.disabled = false;
+}
+
+async function startEngine() {
+  const Engine = settings.engine === 'fast' ? FastEngine : PreciseEngine;
+  engine = new Engine({
+    settings,
+    glossary,
+    stream,
+    audioCtx,
+    onSegment: handleSegment,
+    onRemove: removeSegment,
+    onStatus: (state) => {
+      setStatus(state);
+      if (state === 'error') stop();
+    },
+    onError: (err) => showToast(err.message || String(err)),
+    onLevel: (level) => els.status.style.setProperty('--level', level.toFixed(2)),
+  });
+  try {
+    await engine.start();
+  } catch (err) {
+    showToast(err.message || String(err));
+  }
+}
+
+function stop() {
+  if (!running) return;
+  running = false;
+  engine?.stop();
+  engine = null;
+  // 정밀 모드는 마지막 문장 결과를 1.5초 정도 더 기다리므로 마이크는 조금 뒤에 끈다
+  const oldStream = stream;
+  const oldCtx = audioCtx;
+  stream = null;
+  audioCtx = null;
+  setTimeout(() => {
+    oldStream?.getTracks().forEach((t) => t.stop());
+    oldCtx?.close();
+  }, 1600);
+  window.speechSynthesis?.cancel();
+  releaseWakeLock();
+  if (record) {
+    record.endedAt = Date.now();
+    persistRecord();
+  }
+  els.status.style.setProperty('--level', 0);
+  setStatus('idle');
+  updateRunningUi();
+}
+
+async function restartEngine() {
+  if (!running) return;
+  engine?.stop();
+  engine = null;
+  await startEngine();
+}
+
+function updateRunningUi() {
+  els.startBtn.classList.toggle('running', running);
+  els.startLabel.textContent = running ? '정지' : '시작';
+  if (!running) els.jumpBtn.hidden = true;
+}
+
+function setStatus(state) {
+  els.status.dataset.state = state;
+  els.statusLabel.textContent = STATUS_LABELS[state] || state;
+  els.status.title = STATUS_LABELS[state] || state;
+}
+
+// ======================================================================
+// 자막 표시
+// ======================================================================
+
+function handleSegment(seg) {
+  renderSegment(seg);
+  if (seg.final) {
+    saveSegment(seg);
+    speak(seg);
+  }
+}
+
+function renderSegment(seg) {
+  let el = segNodes.get(seg.id);
+  if (!el) {
+    el = document.createElement('article');
+    el.className = 'seg';
+    el.dataset.ts = seg.ts;
+    el.innerHTML = '<div class="meta"></div><div class="tr"></div><div class="src"></div>';
+    insertInOrder(el, seg.ts);
+    segNodes.set(seg.id, el);
+    els.empty.hidden = true;
+    markRecent();
+  }
+
+  const failed = seg.error && !seg.tr;
+  el.classList.toggle('live', !seg.srcFinal);
+  el.classList.toggle('streaming', seg.srcFinal && !seg.final);
+  el.classList.toggle('error', !!failed);
+  el.querySelector('.meta').textContent = `${dirTag(seg.dir)} · ${timeOf(seg.ts)}`;
+  el.querySelector('.tr').textContent = failed ? '번역에 실패했습니다 (원문 참고)' : seg.tr;
+  el.querySelector('.src').textContent = seg.src;
+  scrollIfStuck();
+}
+
+function insertInOrder(el, ts) {
+  // 인식 결과가 순서가 뒤바뀌어 도착할 수 있어서 시간순으로 끼워 넣는다
+  let before = null;
+  for (let node = els.feed.lastElementChild; node && node.classList.contains('seg'); node = node.previousElementSibling) {
+    if (Number(node.dataset.ts) <= ts) break;
+    before = node;
+  }
+  els.feed.insertBefore(el, before);
+}
+
+function markRecent() {
+  const segs = els.feed.querySelectorAll('.seg');
+  segs.forEach((node, i) => node.classList.toggle('recent', i >= segs.length - 2));
+}
+
+function removeSegment(id) {
+  const el = segNodes.get(id);
+  if (!el) return;
+  el.remove();
+  segNodes.delete(id);
+  markRecent();
+  if (record) record.items = record.items.filter((it) => it.id !== id);
+}
+
+function clearFeed() {
+  for (const el of segNodes.values()) el.remove();
+  segNodes.clear();
+  els.empty.hidden = false;
+}
+
+function dirTag(dir) {
+  return dir === 'ko2en' ? 'KO → EN' : dir === 'en2ko' ? 'EN → KO' : '···';
+}
+
+function timeOf(ts) {
+  return new Date(ts).toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+}
+
+function isNearBottom() {
+  const f = els.feed;
+  return f.scrollTop + f.clientHeight >= f.scrollHeight - 80;
+}
+
+function scrollIfStuck() {
+  if (stickToBottom) {
+    requestAnimationFrame(() => { els.feed.scrollTop = els.feed.scrollHeight; });
+  } else if (running) {
+    els.jumpBtn.hidden = false;
+  }
+}
+
+els.feed.addEventListener('scroll', () => {
+  stickToBottom = isNearBottom();
+  if (stickToBottom) els.jumpBtn.hidden = true;
+}, { passive: true });
+
+els.jumpBtn.addEventListener('click', () => {
+  stickToBottom = true;
+  els.jumpBtn.hidden = true;
+  els.feed.scrollTop = els.feed.scrollHeight;
+});
+
+// ======================================================================
+// 글자 크기 · 테마 · 원문 표시
+// ======================================================================
+
+function autoFontSize() {
+  return Math.round(Math.min(56, Math.max(22, window.innerWidth / 26)));
+}
+
+function applyFontSize() {
+  const size = settings.fontSize || autoFontSize();
+  document.documentElement.style.setProperty('--fs', `${size}px`);
+}
+
+function changeFont(factor) {
+  const current = settings.fontSize || autoFontSize();
+  settings.fontSize = Math.round(Math.min(120, Math.max(16, current * factor)));
+  saveSettings(settings);
+  applyFontSize();
+  showToast(`글자 크기 ${settings.fontSize}px`, 'info', 1200);
+}
+
+function applyTheme() {
+  document.documentElement.dataset.theme = settings.theme;
+  const dark = settings.theme === 'dark' || (settings.theme === 'system' && !matchMedia('(prefers-color-scheme: light)').matches);
+  document.querySelector('meta[name="theme-color"]').content = dark ? '#0d1117' : '#ffffff';
+}
+
+function applyShowSource() {
+  els.feed.classList.toggle('hide-source', !settings.showSource);
+}
+
+$('#fontUp').addEventListener('click', () => changeFont(1.12));
+$('#fontDown').addEventListener('click', () => changeFont(1 / 1.12));
+window.addEventListener('resize', () => { if (!settings.fontSize) applyFontSize(); });
+
+// ======================================================================
+// 언어 방향
+// ======================================================================
+
+function applyDirection() {
+  els.dirChip.textContent = DIRECTION_LABELS[settings.direction];
+  $$('input[name="direction"]').forEach((r) => { r.checked = r.value === settings.direction; });
+}
+
+els.dirChip.addEventListener('click', () => {
+  const order = ['auto', 'en2ko', 'ko2en'];
+  setDirection(order[(order.indexOf(settings.direction) + 1) % order.length]);
+});
+
+function setDirection(dir) {
+  if (settings.direction === dir) return;
+  settings.direction = dir;
+  saveSettings(settings);
+  applyDirection();
+  showToast(`언어 방향: ${DIRECTION_LABELS[dir]}`, 'info', 1500);
+  restartEngine();
+}
+
+// ======================================================================
+// 음성 읽어주기
+// ======================================================================
+
+function applyTts() {
+  els.ttsBtn.setAttribute('aria-pressed', String(settings.tts));
+  engine?.setTts?.(settings.tts);
+}
+
+els.ttsBtn.addEventListener('click', () => {
+  settings.tts = !settings.tts;
+  saveSettings(settings);
+  unlockSpeech();
+  applyTts();
+  if (!settings.tts) window.speechSynthesis?.cancel();
+  showToast(settings.tts
+    ? '번역 음성 읽기 켜짐 — 이어폰을 사용하세요. 스피커로 나오면 마이크가 그 소리를 다시 인식할 수 있습니다.'
+    : '번역 음성 읽기 꺼짐', 'info', settings.tts ? 4500 : 1500);
+});
+
+let speechUnlocked = false;
+function unlockSpeech() {
+  // iOS Safari는 사용자 탭 안에서 한 번 말해야 이후 음성 출력이 허용된다
+  if (speechUnlocked || !('speechSynthesis' in window)) return;
+  const u = new SpeechSynthesisUtterance(' ');
+  u.volume = 0;
+  window.speechSynthesis.speak(u);
+  speechUnlocked = true;
+}
+
+function pickVoice(lang) {
+  const voices = window.speechSynthesis.getVoices();
+  const base = lang.slice(0, 2);
+  return voices.find((v) => v.lang === lang && /premium|enhanced|natural|neural/i.test(v.name))
+    || voices.find((v) => v.lang === lang)
+    || voices.find((v) => v.lang.startsWith(base));
+}
+
+function speak(seg) {
+  // 초고속 모드는 AI 통역 음성을 직접 재생하므로 여기서는 정밀 모드만 처리
+  if (!settings.tts || settings.engine !== 'precise' || !running || !seg.tr || seg.error) return;
+  if (!('speechSynthesis' in window)) return;
+  const lang = targetOf(seg.dir) === 'ko' ? 'ko-KR' : 'en-US';
+  const u = new SpeechSynthesisUtterance(seg.tr);
+  u.lang = lang;
+  const voice = pickVoice(lang);
+  if (voice) u.voice = voice;
+  u.rate = 1.08;
+  window.speechSynthesis.speak(u);
+}
+
+// ======================================================================
+// 화면 켜짐 유지 · 전체 화면
+// ======================================================================
+
+async function requestWakeLock() {
+  try {
+    wakeLock = await navigator.wakeLock?.request('screen');
+  } catch { /* 지원하지 않는 브라우저 */ }
+}
+
+function releaseWakeLock() {
+  wakeLock?.release().catch(() => {});
+  wakeLock = null;
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && running) requestWakeLock();
+});
+
+if (!document.fullscreenEnabled) els.fullBtn.hidden = true;
+els.fullBtn.addEventListener('click', toggleFullscreen);
+
+function toggleFullscreen() {
+  if (!document.fullscreenEnabled) return;
+  if (document.fullscreenElement) document.exitFullscreen();
+  else document.documentElement.requestFullscreen().catch(() => {});
+}
+
+// ======================================================================
+// 기록
+// ======================================================================
+
+function newRecord() {
+  const now = Date.now();
+  const d = new Date(now);
+  const title = `${d.getMonth() + 1}월 ${d.getDate()}일 ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+    + (settings.topic ? ` · ${settings.topic.trim().split(/\n/)[0].slice(0, 24)}` : '');
+  record = { id: `s${now}`, title, startedAt: now, endedAt: null, engine: settings.engine, items: [] };
+}
+
+function saveSegment(seg) {
+  if (!record) return;
+  const item = { id: seg.id, ts: seg.ts, dir: seg.dir, src: seg.src, tr: seg.tr };
+  const idx = record.items.findIndex((it) => it.id === seg.id);
+  if (idx >= 0) record.items[idx] = item;
+  else {
+    record.items.push(item);
+    record.items.sort((a, b) => a.ts - b.ts);
+  }
+  if (!sessions.includes(record)) sessions.push(record);
+  persistRecordSoon();
+}
+
+let persistTimer;
+function persistRecordSoon() {
+  clearTimeout(persistTimer);
+  persistTimer = setTimeout(persistRecord, 1000);
+}
+
+function persistRecord() {
+  clearTimeout(persistTimer);
+  if (record && !record.items.length) return;
+  const result = saveSessions(sessions);
+  if (result === 'trimmed') {
+    sessions = loadSessions();
+    showToast('저장 공간이 부족해 가장 오래된 기록을 삭제했습니다.', 'info');
+  } else if (!result) {
+    showToast('기록을 저장하지 못했습니다. 기록 탭에서 오래된 기록을 지워주세요.');
+  }
+}
+
+function renderHistory() {
+  const list = $('#historyList');
+  list.innerHTML = '';
+  const items = [...sessions].sort((a, b) => b.startedAt - a.startedAt);
+  $('#historyEmpty').hidden = items.length > 0;
+
+  for (const s of items) {
+    const li = document.createElement('li');
+    const end = s.endedAt || (s.items.at(-1)?.ts ?? s.startedAt);
+    const mins = Math.max(1, Math.round((end - s.startedAt) / 60000));
+    li.innerHTML = `
+      <div class="h-title"></div>
+      <div class="h-meta"></div>
+      <div class="h-actions">
+        <button type="button" class="btn small" data-act="view">보기</button>
+        <button type="button" class="btn small" data-act="txt">TXT 저장</button>
+        <button type="button" class="btn small" data-act="csv">엑셀(CSV)</button>
+        <button type="button" class="btn small danger" data-act="delete">삭제</button>
+      </div>`;
+    li.querySelector('.h-title').textContent = s.title + (s === record && running ? ' (기록 중)' : '');
+    li.querySelector('.h-meta').textContent = `${new Date(s.startedAt).toLocaleDateString('ko-KR')} · 약 ${mins}분 · ${s.items.length}문장 · ${s.engine === 'fast' ? '초고속' : '정밀'}`;
+    li.addEventListener('click', (e) => {
+      const act = e.target.closest('[data-act]')?.dataset.act;
+      if (act) historyAction(act, s);
+    });
+    list.appendChild(li);
+  }
+}
+
+async function historyAction(act, s) {
+  try {
+    if (act === 'view') openViewer(s);
+    else if (act === 'txt') await deliverFile(exportTxt(s), `${fileBase(s)}.txt`, 'text/plain;charset=utf-8');
+    else if (act === 'csv') await deliverFile(exportCsv(s), `${fileBase(s)}.csv`, 'text/csv;charset=utf-8');
+    else if (act === 'delete') {
+      if (!confirm(`"${s.title}" 기록을 삭제할까요? 되돌릴 수 없습니다.`)) return;
+      sessions = sessions.filter((x) => x !== s);
+      if (s === record) record = null;
+      saveSessions(sessions);
+      renderHistory();
+    }
+  } catch (err) {
+    if (err.name !== 'AbortError') showToast('내보내기 실패: ' + err.message);
+  }
+}
+
+function fileBase(s) {
+  const d = new Date(s.startedAt);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `HYJK_${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}`;
+}
+
+function openViewer(s) {
+  $('#viewerTitle').textContent = s.title;
+  const body = $('#viewerBody');
+  body.innerHTML = '';
+  for (const it of s.items) {
+    const div = document.createElement('div');
+    div.className = 'v-item';
+    div.innerHTML = '<div class="v-time"></div><div class="v-tr"></div><div class="v-src"></div>';
+    div.querySelector('.v-time').textContent = `${timeOf(it.ts)} · ${dirTag(it.dir)}`;
+    div.querySelector('.v-tr').textContent = it.tr;
+    div.querySelector('.v-src').textContent = it.src;
+    body.appendChild(div);
+  }
+  els.panel.close();
+  els.viewer.showModal();
+}
+
+$('#newSessionBtn').addEventListener('click', () => {
+  if (record) {
+    record.endedAt = Date.now();
+    persistRecord();
+  }
+  record = null;
+  clearFeed();
+  if (running) newRecord();
+  els.panel.close();
+  showToast('화면을 비우고 새 기록을 시작합니다.', 'info', 1800);
+});
+
+// ======================================================================
+// 설정 패널
+// ======================================================================
+
+function openPanel(tab = 'settings') {
+  fillSettingsForm();
+  selectTab(tab);
+  if (!els.panel.open) els.panel.showModal();
+}
+
+function selectTab(tab) {
+  $$('.tabs [data-tab]').forEach((b) => b.setAttribute('aria-selected', String(b.dataset.tab === tab)));
+  $$('[data-pane]').forEach((p) => { p.hidden = p.dataset.pane !== tab; });
+  if (tab === 'history') renderHistory();
+}
+
+$$('.tabs [data-tab]').forEach((b) => b.addEventListener('click', () => selectTab(b.dataset.tab)));
+$('#menuBtn').addEventListener('click', () => openPanel('settings'));
+$$('[data-open]').forEach((b) => b.addEventListener('click', () => openPanel(b.dataset.open)));
+$$('dialog [data-close]').forEach((b) => b.addEventListener('click', () => b.closest('dialog').close()));
+$$('dialog').forEach((d) => d.addEventListener('click', (e) => { if (e.target === d) d.close(); }));
+els.panel.addEventListener('close', () => updateKeyHint());
+
+function fillSettingsForm() {
+  $('#apiKey').value = settings.apiKey;
+  $('#topic').value = settings.topic;
+  $('#showSource').checked = settings.showSource;
+  $('#sttModel').value = settings.sttModel;
+  $('#mtModel').value = settings.mtModel;
+  $('#silenceMs').value = settings.silenceMs;
+  $('#silenceOut').textContent = `${(settings.silenceMs / 1000).toFixed(1)}초`;
+  for (const name of ['engine', 'direction', 'noise', 'theme']) {
+    $$(`input[name="${name}"]`).forEach((r) => { r.checked = r.value === settings[name]; });
+  }
+  const glossaryText = loadGlossaryText();
+  $('#glossary').value = glossaryText;
+  updateGlossaryCount(glossaryText);
+  refreshMicList();
+}
+
+function update(key, value, { restart = false } = {}) {
+  if (settings[key] === value) return;
+  settings[key] = value;
+  saveSettings(settings);
+  if (restart) restartEngine();
+}
+
+$('#apiKey').addEventListener('change', (e) => update('apiKey', e.target.value.trim()));
+$('#topic').addEventListener('change', (e) => update('topic', e.target.value));
+$('#mtModel').addEventListener('change', (e) => update('mtModel', e.target.value.trim() || 'gpt-6-luna'));
+$('#sttModel').addEventListener('change', (e) => update('sttModel', e.target.value, { restart: settings.engine === 'precise' }));
+$('#showSource').addEventListener('change', (e) => { update('showSource', e.target.checked); applyShowSource(); });
+$('#silenceMs').addEventListener('input', (e) => { $('#silenceOut').textContent = `${(e.target.value / 1000).toFixed(1)}초`; });
+$('#silenceMs').addEventListener('change', (e) => update('silenceMs', Number(e.target.value), { restart: settings.engine === 'precise' }));
+
+for (const name of ['engine', 'direction', 'noise', 'theme']) {
+  $$(`input[name="${name}"]`).forEach((r) => r.addEventListener('change', () => {
+    if (!r.checked) return;
+    if (name === 'direction') return setDirection(r.value);
+    update(name, r.value, { restart: name !== 'theme' });
+    if (name === 'theme') applyTheme();
+  }));
+}
+
+$('#micSelect').addEventListener('change', async (e) => {
+  update('micId', e.target.value);
+  if (running) {
+    stop();
+    setTimeout(start, 1700);
+  }
+});
+
+async function refreshMicList() {
+  const select = $('#micSelect');
+  try {
+    const devices = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === 'audioinput');
+    select.innerHTML = '<option value="">기본 마이크</option>';
+    devices.forEach((d, i) => {
+      if (!d.deviceId || d.deviceId === 'default') return;
+      const opt = document.createElement('option');
+      opt.value = d.deviceId;
+      opt.textContent = d.label || `마이크 ${i + 1}`;
+      select.appendChild(opt);
+    });
+    select.value = settings.micId;
+    if (select.value !== settings.micId) select.value = '';
+  } catch { /* 장치 목록을 볼 수 없는 환경 */ }
+}
+
+$('#testKeyBtn').addEventListener('click', async () => {
+  const key = $('#apiKey').value.trim();
+  update('apiKey', key);
+  const out = $('#keyResult');
+  out.hidden = false;
+  out.className = 'help result';
+  if (!key) {
+    out.textContent = 'API 키를 입력해주세요.';
+    out.classList.add('bad');
+    return;
+  }
+  out.textContent = '확인 중...';
+  try {
+    const models = await testApiKey(key);
+    const need = ['gpt-live-transcribe', 'gpt-realtime-translate', settings.mtModel];
+    const missing = need.filter((m) => !models.includes(m));
+    if (missing.length) {
+      out.textContent = `연결은 성공했지만 이 계정에서 다음 모델이 보이지 않습니다: ${missing.join(', ')}. 결제 등록 여부를 확인해주세요.`;
+      out.classList.add('bad');
+    } else {
+      out.textContent = '✓ 연결 성공 — 정밀/초고속 모드 모두 사용할 수 있습니다.';
+      out.classList.add('ok');
+    }
+  } catch (err) {
+    out.textContent = err.message;
+    out.classList.add('bad');
+  }
+  updateKeyHint();
+});
+
+// 용어 사전
+function updateGlossaryCount(text) {
+  $('#glossaryCount').textContent = `${parseGlossary(text).length}개 용어`;
+}
+$('#glossary').addEventListener('input', (e) => updateGlossaryCount(e.target.value));
+$('#saveGlossary').addEventListener('click', () => {
+  const text = $('#glossary').value;
+  saveGlossaryText(text);
+  glossary = parseGlossary(text);
+  if (engine?.kind === 'precise') engine.glossary = glossary; // 번역에는 바로 반영
+  showToast(`용어 ${glossary.length}개를 저장했습니다.`, 'info', 1800);
+});
+
+function updateKeyHint() {
+  els.emptyKeyHint.hidden = !!settings.apiKey;
+}
+
+// ======================================================================
+// 알림
+// ======================================================================
+
+let toastTimer;
+let lastToast = { text: '', at: 0 };
+function showToast(text, kind = 'error', ms = 6000) {
+  const now = Date.now();
+  if (text === lastToast.text && now - lastToast.at < 3000) return;
+  lastToast = { text, at: now };
+  els.toast.textContent = text;
+  els.toast.className = `toast ${kind}`;
+  els.toast.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { els.toast.hidden = true; }, ms);
+}
+els.toast.addEventListener('click', () => { els.toast.hidden = true; });
+
+// ======================================================================
+// 단축키 · 초기화
+// ======================================================================
+
+els.startBtn.addEventListener('click', () => (running ? stop() : start()));
+
+document.addEventListener('keydown', (e) => {
+  if (e.target.closest('input, textarea, select') || document.querySelector('dialog[open]')) return;
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  if (e.code === 'Space') { e.preventDefault(); running ? stop() : start(); }
+  else if (e.key === '+' || e.key === '=') changeFont(1.12);
+  else if (e.key === '-') changeFont(1 / 1.12);
+  else if (e.key === 'f' || e.key === 'F') toggleFullscreen();
+});
+
+window.addEventListener('pagehide', () => persistRecord());
+
+applyTheme();
+applyFontSize();
+applyShowSource();
+applyDirection();
+applyTts();
+updateKeyHint();
+setStatus('idle');
+
+// 주소 끝에 ?demo 를 붙이면 예시 자막을 보여준다 (프로젝터에서 글자 크기 맞춰볼 때)
+if (new URLSearchParams(location.search).has('demo')) {
+  const now = Date.now();
+  const samples = [
+    ['en2ko', 'Good morning, everyone. It is great to be here in Seoul with all of you.', '여러분, 좋은 아침입니다. 이렇게 서울에서 여러분과 함께하게 되어 정말 기쁩니다.'],
+    ['en2ko', 'Today I want to talk about three habits that top performers share.', '오늘은 최고의 성과를 내는 사람들이 공통적으로 가진 세 가지 습관에 대해 말씀드리겠습니다.'],
+    ['ko2en', '고객님, 지금 사용하시는 제품에서 가장 불편하신 점이 무엇인가요?', 'What do you find most inconvenient about the product you are using now?'],
+  ];
+  samples.forEach(([dir, src, tr], i) => {
+    handleSegment({ id: `demo${i}`, ts: now - (samples.length - i) * 9000, dir, src, tr, srcFinal: true, final: true });
+  });
+  renderSegment({ id: 'demo-live', ts: now, dir: 'en2ko', src: 'The first habit is that they listen before they', tr: '', srcFinal: false, final: false });
+}
+
+if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
+  navigator.serviceWorker.register('sw.js').catch(() => {});
+}
