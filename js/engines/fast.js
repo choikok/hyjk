@@ -2,7 +2,7 @@
 // 모델이 한 세션에 한 가지 출력 언어만 지원하므로, 자동 모드에서는 한국어용·영어용 세션 두 개를 동시에 연다.
 // 각 세션은 이미 출력 언어로 말한 내용은 번역하지 않으므로, 원문 언어를 보고 해당하는 쪽만 화면에 보여준다.
 
-import { createClientSecret, connectRealtime } from '../openai.js';
+import { createClientSecret, connectRealtime, checkCredits, isQuotaError, QUOTA_MESSAGE } from '../openai.js';
 import { VoiceActivity } from '../vad.js';
 import { detectLang, directionFor } from '../lang.js';
 
@@ -90,14 +90,26 @@ export class FastEngine {
       this.reportStatus();
     } catch (err) {
       if (gen !== lane.gen) return;
-      this.cb.onError(err);
-      if (err.status === 400 || err.status === 401 || err.status === 403) {
-        this.running = false;
-        this.cb.onStatus('error');
-      } else {
-        this.scheduleReconnect(lane);
+      if (err.fatal) return this.fail(err);
+      if (err.status >= 500) {
+        // 실시간 연결은 잔액이 없을 때 원인 없이 500을 돌려주는 경우가 있어 잔액부터 확인한다
+        try {
+          await checkCredits(this.settings.apiKey, this.settings.mtModel);
+        } catch (creditErr) {
+          if (creditErr.fatal) return this.fail(creditErr);
+        }
       }
+      if (!this.running) return;
+      this.cb.onError(err);
+      this.scheduleReconnect(lane);
     }
+  }
+
+  fail(err) {
+    if (!this.running) return;
+    this.running = false;
+    this.cb.onError(err);
+    this.cb.onStatus('error');
   }
 
   reportStatus(state) {
@@ -144,7 +156,8 @@ export class FastEngine {
         if (this.running) this.scheduleReconnect(lane);
         break;
       case 'error':
-        this.cb.onError(new Error(ev.error?.message || '동시통역 오류'));
+        if (isQuotaError(ev.error)) this.fail(new Error(QUOTA_MESSAGE));
+        else this.cb.onError(new Error(ev.error?.message || '동시통역 오류'));
         break;
       default:
         break;

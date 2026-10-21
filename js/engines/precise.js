@@ -1,25 +1,38 @@
 // 정밀 모드: OpenAI 실시간 음성인식(원문 스트리밍) → 문장이 끝나면 GPT가 용어 사전을 반영해 번역(스트리밍)
 
-import { createClientSecret, connectRealtime, streamText } from '../openai.js';
+import { createClientSecret, connectRealtime, streamText, checkCredits, isQuotaError, QUOTA_MESSAGE } from '../openai.js';
 import { VoiceActivity } from '../vad.js';
 import { detectLang, directionFor, targetOf, LANG_NAMES } from '../lang.js';
 
 const CLIENT_VAD_MODELS = new Set(['gpt-live-transcribe']); // 서버 VAD를 지원하지 않아 직접 끊어줘야 하는 모델
+const FALLBACK_STT_MODEL = 'gpt-4o-transcribe';           // 브라우저(WebRTC) 연결이 확인된 안정형 모델
 
 export class PreciseEngine {
-  constructor({ settings, glossary, stream, audioCtx, onSegment, onRemove, onStatus, onError, onLevel }) {
+  constructor({ settings, glossary, stream, audioCtx, onSegment, onRemove, onStatus, onError, onNotice, onLevel }) {
     this.kind = 'precise';
     this.settings = settings;
     this.glossary = glossary;
     this.stream = stream;
     this.audioCtx = audioCtx;
-    this.cb = { onSegment, onRemove, onStatus, onError, onLevel };
+    this.cb = { onSegment, onRemove, onStatus, onError, onNotice, onLevel };
     this.segs = new Map();     // item_id -> segment
     this.history = [];         // 번역 문맥용 최근 원문
     this.seq = 0;
     this.gen = 0;
     this.running = false;
-    this.clientVad = CLIENT_VAD_MODELS.has(settings.sttModel);
+    this.setSttModel(settings.sttModel);
+  }
+
+  setSttModel(model) {
+    this.sttModel = model;
+    this.clientVad = CLIENT_VAD_MODELS.has(model);
+  }
+
+  fail(err) {
+    if (!this.running) return;
+    this.running = false;
+    this.cb.onError(err);
+    this.cb.onStatus('error');
   }
 
   async start() {
@@ -55,7 +68,7 @@ export class PreciseEngine {
   sessionConfig() {
     const s = this.settings;
     const languages = s.direction === 'auto' ? ['en', 'ko'] : s.direction === 'en2ko' ? ['en'] : ['ko'];
-    const transcription = { model: s.sttModel };
+    const transcription = { model: this.sttModel };
 
     if (this.clientVad) {
       transcription.languages = languages;
@@ -124,15 +137,30 @@ export class PreciseEngine {
       this.cb.onStatus('listening');
     } catch (err) {
       if (gen !== this.gen) return;
+      // 키 오류·잔액 없음 같은 문제는 재시도해도 소용없다
+      if (err.fatal) return this.fail(err);
+      if (err.status >= 500) return this.recoverFromServerError(err);
       this.cb.onError(err);
-      // 키 오류 같은 설정 문제는 재시도해도 소용없다
-      if (err.status === 400 || err.status === 401 || err.status === 403) {
-        this.running = false;
-        this.cb.onStatus('error');
-      } else {
-        this.scheduleReconnect();
-      }
+      this.scheduleReconnect();
     }
+  }
+
+  // 실시간 연결이 500으로 실패하면: 잔액 부족인지 먼저 확인하고, 아니면 안정형 인식 모델로 바꿔 다시 연결한다
+  async recoverFromServerError(err) {
+    try {
+      await checkCredits(this.settings.apiKey, this.settings.mtModel);
+    } catch (creditErr) {
+      if (creditErr.fatal) return this.fail(creditErr);
+    }
+    if (!this.running) return;
+    if (this.sttModel !== FALLBACK_STT_MODEL) {
+      this.cb.onNotice?.(`${this.sttModel} 연결에 실패해 ${FALLBACK_STT_MODEL} 모델로 전환합니다.`);
+      this.setSttModel(FALLBACK_STT_MODEL);
+      this.connect();
+      return;
+    }
+    this.cb.onError(err);
+    this.scheduleReconnect();
   }
 
   handleState(state) {
@@ -195,6 +223,11 @@ export class PreciseEngine {
       case 'error': {
         const code = ev.error?.code || '';
         if (/commit_empty|buffer_too_small/i.test(code)) break; // 말이 없을 때 commit한 경우
+        if (isQuotaError(ev.error)) {
+          this.fail(new Error(QUOTA_MESSAGE));
+          this.conn?.close();
+          break;
+        }
         this.cb.onError(new Error(ev.error?.message || '실시간 인식 오류'));
         break;
       }
@@ -262,7 +295,8 @@ export class PreciseEngine {
       });
     } catch (err) {
       seg.error = true;
-      this.cb.onError(err);
+      if (err.fatal && this.running) this.fail(err);
+      else this.cb.onError(err);
     }
     seg.final = true;
     this.segs.delete(seg.itemId);

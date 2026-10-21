@@ -2,12 +2,22 @@
 
 const API = 'https://api.openai.com/v1';
 
+export const QUOTA_MESSAGE = 'OpenAI 잔액(크레딧)이 없습니다. platform.openai.com → Settings → Billing에서 충전한 뒤 다시 시작해주세요.';
+
 export class ApiError extends Error {
-  constructor(message, status, body) {
+  constructor(message, status, body, { fatal = false } = {}) {
     super(message);
     this.status = status;
     this.body = body;
+    // fatal: 다시 연결해도 해결되지 않는 오류(키 오류, 잔액 없음, 잘못된 설정) → 재시도하지 않고 멈춘다
+    this.fatal = fatal;
   }
+}
+
+export function isQuotaError(error) {
+  const e = error?.error || error || {};
+  return /insufficient_quota|credit_balance/i.test(`${e.code || ''} ${e.type || ''}`)
+    || /no credits remaining|exceeded your current quota/i.test(e.message || '');
 }
 
 async function apiError(res) {
@@ -17,9 +27,24 @@ async function apiError(res) {
     body = await res.json();
     if (body?.error?.message) message = body.error.message;
   } catch { /* 본문 없음 */ }
-  if (res.status === 401) message = 'API 키가 올바르지 않습니다. 설정에서 키를 확인해주세요.';
-  if (res.status === 429) message = `요청 한도 초과 또는 잔액 부족: ${message}`;
+
+  if (body?.error && isQuotaError(body.error)) return new ApiError(QUOTA_MESSAGE, res.status, body, { fatal: true });
+  if (res.status === 401) return new ApiError('API 키가 올바르지 않습니다. 설정에서 키를 확인해주세요.', 401, body, { fatal: true });
+  if (res.status === 403) return new ApiError(`이 API 키로는 사용할 수 없는 기능입니다: ${message}`, 403, body, { fatal: true });
+  if (res.status === 400) return new ApiError(`설정 오류: ${message}`, 400, body, { fatal: true });
+  if (res.status === 429) message = `요청이 너무 많습니다. 잠시 후 다시 연결합니다. (${message})`;
+  if (res.status >= 500) message = `OpenAI 서버 오류 (HTTP ${res.status})`;
   return new ApiError(message, res.status, body);
+}
+
+// 잔액이 있는지 아주 작은 요청으로 확인한다 (실시간 연결은 잔액이 없을 때 원인 없이 500만 돌려주는 경우가 있다)
+export async function checkCredits(apiKey, model = 'gpt-6-luna') {
+  const res = await safeFetch(`${API}/responses`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model, input: 'ok', max_output_tokens: 16, store: false }),
+  });
+  if (!res.ok) throw await apiError(res);
 }
 
 // 네트워크 오류(인터넷 끊김, 또는 오류 응답에 CORS 헤더가 없는 경우)를 알아보기 쉬운 메시지로 바꾼다
@@ -98,6 +123,7 @@ export async function connectRealtime({ secret, callsPath, track, onEvent, onRem
     await pc.setRemoteDescription({ type: 'answer', sdp: await res.text() });
     await opened;
   } catch (err) {
+    onStateChange = null; // 실패해서 닫는 것이므로 '연결 끊김'으로 알리지 않는다
     pc.close();
     throw err;
   }

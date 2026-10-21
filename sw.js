@@ -2,7 +2,7 @@
 // (번역은 인터넷이 필요하다. OpenAI 요청은 캐시하지 않는다.)
 // 앱 파일을 수정하면 VERSION을 올려야 사용자 기기에 새 버전이 적용된다.
 
-const VERSION = 'hyjk-v1';
+const VERSION = 'hyjk-v2';
 const ASSETS = [
   './',
   'index.html',

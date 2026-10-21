@@ -24,7 +24,11 @@ http.createServer((req, res) => {
   if (urlPath.endsWith('/')) file = path.join(file, 'index.html');
   fs.readFile(file, (err, data) => {
     if (err) { res.writeHead(404); res.end('Not found'); return; }
-    res.writeHead(200, { 'Content-Type': TYPES[path.extname(file)] || 'application/octet-stream', 'Cache-Control': 'no-cache' });
+    res.writeHead(200, {
+      'Content-Type': TYPES[path.extname(file)] || 'application/octet-stream',
+      'Cache-Control': 'no-cache',
+      'Access-Control-Allow-Origin': '*', // 배포된 사이트에서 로컬 수정본을 불러와 시험할 수 있게
+    });
     res.end(data);
   });
 }).listen(PORT, () => console.log(`HYJK: http://localhost:${PORT}`));

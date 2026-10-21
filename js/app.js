@@ -1,7 +1,7 @@
 import {
   loadSettings, saveSettings, loadGlossaryText, saveGlossaryText, parseGlossary, loadSessions, saveSessions,
 } from './store.js';
-import { testApiKey } from './openai.js';
+import { testApiKey, checkCredits } from './openai.js';
 import { PreciseEngine } from './engines/precise.js';
 import { FastEngine } from './engines/fast.js';
 import { DIRECTION_LABELS, targetOf } from './lang.js';
@@ -115,6 +115,7 @@ async function startEngine() {
       if (state === 'error') stop();
     },
     onError: (err) => showToast(err.message || String(err)),
+    onNotice: (text) => showToast(text, 'info', 4000),
     onLevel: (level) => els.status.style.setProperty('--level', level.toFixed(2)),
   });
   try {
@@ -629,7 +630,8 @@ $('#testKeyBtn').addEventListener('click', async () => {
   out.textContent = '확인 중...';
   try {
     const models = await testApiKey(key);
-    const need = ['gpt-live-transcribe', 'gpt-realtime-translate', settings.mtModel];
+    await checkCredits(key, settings.mtModel); // 키가 맞아도 잔액이 없으면 통역이 안 되므로 함께 확인
+    const need = ['gpt-4o-transcribe', 'gpt-realtime-translate', settings.mtModel];
     const missing = need.filter((m) => !models.includes(m));
     if (missing.length) {
       out.textContent = `연결은 성공했지만 이 계정에서 다음 모델이 보이지 않습니다: ${missing.join(', ')}. 결제 등록 여부를 확인해주세요.`;
